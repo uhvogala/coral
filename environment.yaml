@@ -5,11 +5,14 @@ channels:
   - defaults
 dependencies:
   - python=3.10
-  - numpy
+  - defaults::numpy
   - matplotlib
-  - fastapi
+  - fastapi<0.111.0
   - uvicorn
   - pip
+  - mkl
+  - intel-openmp
+  - mkl-service
   - pytorch::pytorch
   - pytorch::torchvision
   - pytorch::torchaudio
