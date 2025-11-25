@@ -1,0 +1,1006 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>C.O.R.A.L. Visualization</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: white; font-family: monospace; display: flex; flex-direction: column; height: 100vh; }
+        #viz-container { flex: 2; position: relative; overflow: hidden; }
+        #diagnostics-container { flex: 1; background: #0a0a0a; border-top: 1px solid #333; display: flex; padding: 10px; gap: 10px; }
+        .panel { flex: 1; background: #111; border: 1px solid #333; position: relative; }
+        .panel-title { position: absolute; top: 5px; left: 5px; font-size: 12px; color: #888; pointer-events: none; }
+        canvas.diag-canvas { width: 100%; height: 100%; display: block; }
+        #info { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 10px; pointer-events: none; z-index: 10; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="viz-container">
+        <div id="info">
+            <h1>C.O.R.A.L. Live View</h1>
+            <div id="stats">Waiting for data...</div>
+            <button id="btnAutoZoom" onclick="toggleAutoZoom()" style="pointer-events: auto; background: rgba(255,255,255,0.1); border: 1px solid #555; color: white; padding: 5px 10px; cursor: pointer; margin-top: 10px;">Auto Zoom: OFF</button>
+        </div>
+    </div>
+    <div id="diagnostics-container">
+        <div class="panel">
+            <div class="panel-title">NETWORK BLUEPRINT</div>
+            <canvas id="blueprintCanvas" class="diag-canvas"></canvas>
+        </div>
+        <div class="panel">
+            <div class="panel-title">HIPPOCAMPAL DISTRIBUTION</div>
+            <canvas id="memoryCanvas" class="diag-canvas"></canvas>
+        </div>
+        <div class="panel">
+            <div class="panel-title">WEIGHT MONITOR</div>
+            <canvas id="weightsCanvas" class="diag-canvas"></canvas>
+        </div>
+        <div class="panel">
+            <div class="panel-title">TRAINING VITALS</div>
+            <canvas id="vitalsCanvas" class="diag-canvas"></canvas>
+        </div>
+    </div>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x050505); // Darker background
+        scene.fog = new THREE.FogExp2(0x050505, 0.002); // Reduced fog density for better visibility at distance
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000); // Increased far plane
+        camera.position.set(25, 10, 35);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight * 0.66); // Initial size estimate
+        renderer.toneMapping = THREE.ReinhardToneMapping;
+        document.getElementById('viz-container').appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.autoRotate = true;
+        controls.autoRotateSpeed = 0.5;
+
+        // Post-Processing (Bloom)
+        const renderScene = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight * 0.66), 1.5, 0.4, 0.85);
+        bloomPass.threshold = 0.15;
+        bloomPass.strength = 0.6; // Reduced glow for clarity
+        bloomPass.radius = 0.4;
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x555555); // Brighter ambient
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 3.0); // Directional light doesn't decay with distance
+        camera.add(dirLight); // Light follows camera direction
+        scene.add(camera);
+
+        // Background Particles (Neural Dust) - REMOVED for Performance
+        /*
+        const particlesGeo = new THREE.BufferGeometry();
+        const particleCount = 2000;
+        const posArray = new Float32Array(particleCount * 3);
+        for(let i=0; i<particleCount*3; i++) {
+            posArray[i] = (Math.random() - 0.5) * 100;
+        }
+        particlesGeo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+        const particlesMat = new THREE.PointsMaterial({ size: 0.1, color: 0x0044aa, transparent: true, opacity: 0.5 });
+        const particles = new THREE.Points(particlesGeo, particlesMat);
+        scene.add(particles);
+        */
+
+        // State
+        let layersGroup = new THREE.Group();
+        scene.add(layersGroup);
+        
+        // Auto Zoom State
+        let autoZoom = false;
+        window.toggleAutoZoom = function() {
+            autoZoom = !autoZoom;
+            const btn = document.getElementById('btnAutoZoom');
+            btn.innerText = `Auto Zoom: ${autoZoom ? 'ON' : 'OFF'}`;
+            btn.style.background = autoZoom ? 'rgba(0, 255, 0, 0.3)' : 'rgba(255, 255, 255, 0.1)';
+        };
+        
+        // Sleep Mode State
+        let isSleeping = false;
+        let sleepTimer = 0;
+        const pruningParticles = [];
+
+        // Cache for growth animation
+        let previousState = {};
+        let lastStep = -1;
+
+        // Fetch Data
+        async function fetchData() {
+            try {
+                // If opened as file, try 8081 (default) or 8000
+                const baseUrl = (window.location.protocol === 'file:') ? 'http://localhost:8081' : '';
+                const response = await fetch(`${baseUrl}/data`);
+                const data = await response.json();
+                
+                // Detect Sleep Trigger
+                if (data.status === "SLEEPING") {
+                    isSleeping = true;
+                    sleepTimer = 100; // Frames to stay in sleep mode (approx 2s)
+                }
+
+                if (data.step !== lastStep) {
+                    updateViz(data);
+                    updateStats(data);
+                    drawDiagnostics(data);
+                    lastStep = data.step;
+                }
+            } catch (e) {
+                console.error("Error fetching data:", e);
+            }
+        }
+
+        function drawDiagnostics(data) {
+            drawBlueprint(data);
+            drawMemory(data);
+            drawVitals(data);
+            if (data.weights) {
+                const canvas = document.getElementById('weightsCanvas');
+                if (canvas) drawWeights(canvas, data.weights);
+            }
+        }
+
+        function drawWeights(canvas, weights) {
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            
+            // Clear background
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, w, h);
+            
+            // Handle array vs object (backward compatibility)
+            let layers = Array.isArray(weights) ? weights : [weights];
+            
+            // Filter out empty layers or placeholders
+            layers = layers.filter(l => l && l.ffn_up);
+
+            if (layers.length === 0) {
+                ctx.fillStyle = '#444';
+                ctx.font = '12px monospace';
+                ctx.fillText("Waiting for weights...", 10, 40);
+                return;
+            }
+            
+            const pad = 5;
+            const headerH = 15;
+            const topOffset = 25 + headerH; 
+            const availableH = h - topOffset;
+            const layerH = availableH / layers.length;
+            const mapW = (w - pad * 4) / 3;
+            
+            // Draw Column Headers
+            ctx.fillStyle = '#888';
+            ctx.font = '10px monospace';
+            ctx.fillText("FFN FEATURES", pad, 35);
+            ctx.fillText("ATTN QUERY", pad * 2 + mapW, 35);
+            ctx.fillText("ATTN OUT", pad * 3 + mapW * 2, 35);
+            
+            function drawGrid(data, x, y, width, height, colorScale) {
+                if (!data || data.length === 0) return;
+                const rows = data.length;
+                const cols = data[0].length;
+                const cellW = width / cols;
+                const cellH = height / rows;
+                
+                for (let r = 0; r < rows; r++) {
+                    for (let c = 0; c < cols; c++) {
+                        const val = data[r][c]; // 0.0 to 1.0
+                        let color;
+                        if (colorScale === 'blue') {
+                            // Black -> Blue -> Cyan -> White
+                            const v = Math.floor(val * 255);
+                            color = `rgb(${v*0.2}, ${v*0.8}, ${v})`;
+                        } else if (colorScale === 'green') {
+                            const v = Math.floor(val * 255);
+                            color = `rgb(${v*0.2}, ${v}, ${v*0.4})`;
+                        } else {
+                            const v = Math.floor(val * 255);
+                            color = `rgb(${v}, ${v*0.5}, ${v*0.2})`;
+                        }
+                        
+                        ctx.fillStyle = color;
+                        ctx.fillRect(x + c * cellW, y + r * cellH, cellW, cellH);
+                    }
+                }
+                
+                // Border
+                ctx.strokeStyle = '#333';
+                ctx.strokeRect(x, y, width, height);
+            }
+            
+            layers.forEach((layer, idx) => {
+                const y = topOffset + (idx * layerH);
+                const gridY = y + 15; // Space for "LAYER X"
+                const gridH = layerH - 20;
+                
+                if (gridH > 0) {
+                    ctx.fillStyle = '#fff';
+                    ctx.font = '10px monospace';
+                    ctx.fillText(`LAYER ${layer.id + 1}`, 5, y + 10);
+                    
+                    drawGrid(layer.ffn_up, pad, gridY, mapW, gridH, 'blue');
+                    drawGrid(layer.attn_q, pad * 2 + mapW, gridY, mapW, gridH, 'green');
+                    drawGrid(layer.attn_o, pad * 3 + mapW * 2, gridY, mapW, gridH, 'orange');
+                }
+            });
+        }
+
+        function drawBlueprint(data) {
+            const canvas = document.getElementById('blueprintCanvas');
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            
+            // Clear & Background
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, w, h);
+            
+            // Grid Background
+            ctx.strokeStyle = '#1a1a1a';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for(let x=0; x<w; x+=20) { ctx.moveTo(x,0); ctx.lineTo(x,h); }
+            for(let y=0; y<h; y+=20) { ctx.moveTo(0,y); ctx.lineTo(w,y); }
+            ctx.stroke();
+
+            if (!data.layers || data.layers.length === 0) {
+                ctx.fillStyle = '#333';
+                ctx.textAlign = 'center';
+                ctx.fillText("Waiting for structure...", w/2, h/2);
+                return;
+            }
+            
+            const layers = data.layers;
+            const numLayers = layers.length;
+            
+            // Layout Parameters
+            const margin = 20;
+            const availableH = h - (margin*2);
+            // Dynamic height per layer, but capped to prevent overlapping
+            // INCREASED CAP from 60 to 250 to fill space when few layers
+            const layerH = Math.min(availableH / (numLayers + 0.5), 250); 
+            const busX = w / 2;
+            const moduleW = (w / 2) - 40; // Width available for modules
+            
+            // Draw Central Bus (Residual Stream)
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(busX, h - margin);
+            ctx.lineTo(busX, margin);
+            ctx.stroke();
+            
+            // Draw Flow Arrow at top
+            ctx.fillStyle = '#333';
+            ctx.beginPath();
+            ctx.moveTo(busX - 6, margin);
+            ctx.lineTo(busX + 6, margin);
+            ctx.lineTo(busX, margin - 10);
+            ctx.fill();
+
+            // Draw Layers (Bottom to Top)
+            layers.forEach((layer, i) => {
+                // Invert index so layer 0 is at bottom
+                // We center the layers vertically if there are few
+                const totalStackH = numLayers * layerH;
+                const startY = h - margin - ((availableH - totalStackH)/2); 
+                const y = (h - margin) - ((i + 0.5) * layerH);
+                
+                // Layer Node on Bus
+                ctx.fillStyle = '#444';
+                ctx.beginPath();
+                ctx.arc(busX, y, 4, 0, Math.PI*2);
+                ctx.fill();
+                
+                // --- 1. ATTENTION MODULE (Left) ---
+                const attnX = busX - 20 - moduleW;
+                const attnY = y - (layerH * 0.35);
+                const attnH = layerH * 0.7;
+                
+                // Connector
+                ctx.strokeStyle = '#004400';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(busX, y);
+                ctx.lineTo(busX - 15, y);
+                ctx.lineTo(busX - 25, y + (layerH*0.1)); // Circuit trace bend
+                ctx.lineTo(attnX + moduleW, y + (layerH*0.1));
+                ctx.stroke();
+                
+                // Heads Grid
+                const heads = layer.head_mask;
+                const headCount = heads.length;
+                const cols = 8; // Fixed columns for grid
+                const maxRows = 4; // Fixed max rows (32 heads / 8 cols)
+                // Calculate cell size to fit based on CAPACITY, not current count
+                const cellS = Math.min(moduleW / cols, attnH / maxRows) * 0.9;
+                
+                // Draw Capacity Box
+                ctx.strokeStyle = '#112211';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(attnX + moduleW - (cols * (cellS+2)), attnY, cols * (cellS+2), maxRows * (cellS+2));
+
+                heads.forEach((active, hIdx) => {
+                    const r = Math.floor(hIdx / cols);
+                    const c = hIdx % cols;
+                    // Right align heads (grow from bus outwards)
+                    const hx = (attnX + moduleW) - ((c+1) * (cellS + 2)); 
+                    const hy = attnY + (r * (cellS + 2));
+                    
+                    ctx.fillStyle = active ? getEntropyColor(layer.head_entropy ? layer.head_entropy[hIdx] : 0) : '#112211';
+                    ctx.fillRect(hx, hy, cellS, cellS);
+                });
+                
+                // Label
+                ctx.fillStyle = '#00ff00';
+                ctx.font = '10px monospace';
+                ctx.textAlign = 'right';
+                ctx.fillText(`L${i+1} ATTN`, attnX + moduleW, attnY - 2);
+
+                // --- 2. FFN MODULE (Right) ---
+                const ffnX = busX + 20;
+                const ffnY = y - (layerH * 0.35);
+                const ffnH = layerH * 0.7;
+                
+                // Connector
+                ctx.strokeStyle = '#440044';
+                ctx.beginPath();
+                ctx.moveTo(busX, y);
+                ctx.lineTo(busX + 15, y);
+                ctx.lineTo(busX + 25, y + (layerH*0.1));
+                ctx.lineTo(ffnX, y + (layerH*0.1));
+                ctx.stroke();
+                
+                // Chunks Grid (Honeycomb)
+                const chunks = layer.ffn_mask;
+                if (chunks) {
+                    const chunkCount = chunks.length;
+                    const fCols = 8;
+                    // Use actual capacity from the data, not hardcoded 64
+                    // The backend uses chunk_size=8, so 1024/8 = 128 chunks
+                    const maxChunks = chunks.length; 
+                    const maxFRows = Math.ceil(maxChunks / fCols); 
+                    
+                    // Hexagon size calculation based on CAPACITY
+                    // Width = sqrt(3) * size, Height = 2 * size
+                    // Spacing: x = w, y = 3/4 * h
+                    const hexSize = Math.min(moduleW / (fCols * 1.8), ffnH / (maxFRows * 1.6)) * 0.95;
+                    const hexW = Math.sqrt(3) * hexSize;
+                    const hexH = 2 * hexSize;
+                    
+                    // Draw Capacity Tank (Background)
+                    const tankRows = maxFRows;
+                    // Total height from top edge of first row to bottom edge of last row
+                    // Height = (Rows-1) * 0.75*H + H
+                    const totalHexHeight = (tankRows - 1) * (hexH * 0.75) + hexH;
+                    
+                    ctx.strokeStyle = '#332233';
+                    ctx.lineWidth = 1;
+                    // Adjust y-position to start at the top edge of the first hexagon row
+                    // First row center is ffnY. Top edge is ffnY - hexH/2.
+                    ctx.strokeRect(ffnX - 5, ffnY - (hexH/2) - 5, (fCols * hexW) + 10, totalHexHeight + 10);
+                    
+                    chunks.forEach((active, cIdx) => {
+                        const r = Math.floor(cIdx / fCols);
+                        const c = cIdx % fCols;
+                        
+                        // Offset odd rows for honeycomb effect
+                        const xOffset = (r % 2 === 1) ? (hexW / 2) : 0;
+                        
+                        const cx = ffnX + (c * hexW) + xOffset;
+                        const cy = ffnY + (r * (hexH * 0.75));
+                        
+                        drawHexagon(ctx, cx + hexW/2, cy + hexH/2, hexSize);
+                        
+                        if (active) {
+                            // Color by Tier (Memory Atlas)
+                            const tier = layer.ffn_tiers ? layer.ffn_tiers[cIdx] : 1;
+                            const baseColor = getTierColor(tier);
+                            
+                            // Brightness by Activity (Sparse Fire)
+                            const activity = layer.ffn_activity ? layer.ffn_activity[cIdx] : 0;
+                            const glow = Math.min(activity * 8.0, 1.0); // Boosted glow
+                            
+                            ctx.fillStyle = mixColor(baseColor, '#ffffff', glow);
+                            ctx.fill();
+                            
+                            // Glow ring if very active
+                            if (glow > 0.5) {
+                                ctx.strokeStyle = `rgba(255, 255, 255, ${glow * 0.5})`;
+                                ctx.lineWidth = 2;
+                                ctx.stroke();
+                            }
+                        } else {
+                            ctx.strokeStyle = '#221122';
+                            ctx.lineWidth = 1;
+                            ctx.stroke();
+                        }
+                    });
+                }
+                
+                // Label
+                ctx.fillStyle = '#cc66ff';
+                ctx.textAlign = 'left';
+                ctx.fillText(`FFN`, ffnX, ffnY - 2);
+            });
+        }
+
+        function drawHexagon(ctx, x, y, size) {
+            ctx.beginPath();
+            for (let i = 0; i < 6; i++) {
+                const angle_deg = 60 * i - 30;
+                const angle_rad = Math.PI / 180 * angle_deg;
+                const px = x + size * Math.cos(angle_rad);
+                const py = y + size * Math.sin(angle_rad);
+                if (i === 0) ctx.moveTo(px, py);
+                else ctx.lineTo(px, py);
+            }
+            ctx.closePath();
+        }
+
+        function getTierColor(tier) {
+            // Distinct Palette for Tiers
+            const colors = [
+                '#333333', // 0 (Unused)
+                '#00aaff', // 1: Cyan (Foundation)
+                '#00ffaa', // 2: Teal
+                '#00ff00', // 3: Green
+                '#aaff00', // 4: Lime
+                '#ffff00', // 5: Yellow
+                '#ffaa00', // 6: Orange
+                '#ff5500', // 7: Red-Orange (The Wall)
+                '#ff0000', // 8: Red
+                '#ff0055', // 9: Pink
+                '#ff00aa', // 10: Magenta
+                '#aa00ff', // 11: Purple
+                '#5500ff', // 12: Indigo
+                '#0000ff', // 13: Blue
+                '#ffffff'  // 14+: White
+            ];
+            if (tier < colors.length) return colors[tier];
+            // Fallback generator
+            const hue = (tier * 137) % 360; 
+            return `hsl(${hue}, 80%, 60%)`;
+        }
+
+        function mixColor(c1, c2, ratio) {
+            // Simple color mixing helper
+            // Assumes c1 is HSL or Hex, c2 is Hex
+            // For simplicity, we'll just use canvas globalAlpha or overlay
+            // But since we need a string, let's do a hacky HSL lightness boost
+            if (c1.startsWith('hsl')) {
+                // Parse HSL
+                const parts = c1.match(/hsl\((\d+),\s*(\d+)%,\s*(\d+)%\)/);
+                if (parts) {
+                    const h = parts[1];
+                    const s = parts[2];
+                    let l = parseInt(parts[3]);
+                    // Increase lightness based on ratio
+                    l = Math.min(100, l + (ratio * 50));
+                    return `hsl(${h}, ${s}%, ${l}%)`;
+                }
+            }
+            return c1;
+        }
+
+        function getEntropyColor(entropy) {
+            // Low entropy (0.0) = Focused = Cyan/Green
+            // High entropy (1.0) = Confused = Red/Orange
+            const t = Math.min(Math.max(entropy, 0), 1);
+            const r = Math.floor(t * 255);
+            const g = Math.floor((1-t) * 255);
+            const b = 50;
+            return `rgb(${r},${g},${b})`;
+        }
+
+        function drawMemory(data) {
+            const canvas = document.getElementById('memoryCanvas');
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, w, h);
+            
+            const counts = data.hippocampus_tier_counts || {};
+            const tiers = Object.keys(counts).map(Number).sort((a,b) => a-b);
+            if (tiers.length === 0) return;
+            
+            const maxCount = Math.max(...Object.values(counts), 10);
+            const barW = (w - 40) / tiers.length;
+            
+            tiers.forEach((tier, i) => {
+                const count = counts[tier];
+                const barH = (count / maxCount) * (h - 60);
+                const x = 20 + i * barW;
+                const y = h - 30 - barH;
+                
+                ctx.fillStyle = '#00aaff';
+                ctx.fillRect(x + 1, y, barW - 2, barH);
+                
+                // Label
+                if (tiers.length < 20 || i % 5 === 0) {
+                    ctx.fillStyle = '#666';
+                    ctx.font = '10px monospace';
+                    ctx.fillText(tier, x, h - 15);
+                }
+            });
+        }
+
+        function drawVitals(data) {
+            const canvas = document.getElementById('vitalsCanvas');
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, w, h);
+            
+            const history = data.loss_history || [];
+            if (history.length < 2) return;
+            
+            const maxLoss = Math.max(...history, 1.0);
+            const minLoss = 0;
+            
+            ctx.beginPath();
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            
+            history.forEach((loss, i) => {
+                const x = 20 + (i / (history.length - 1)) * (w - 40);
+                const y = h - 30 - ((loss - minLoss) / (maxLoss - minLoss)) * (h - 60);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            
+            // Current Value
+            ctx.fillStyle = '#fff';
+            ctx.font = '12px monospace';
+            ctx.fillText(`Loss: ${history[history.length-1].toFixed(4)}`, w - 100, 20);
+        }
+
+        function updateStats(data) {
+            try {
+                const div = document.getElementById('stats');
+                const statusColor = data.status === 'SLEEPING' ? '#00ffff' : (data.status === 'SENTRY ALERT' ? '#ff0000' : '#00ff00');
+                const lossVal = (typeof data.loss === 'number') ? data.loss.toFixed(4) : '0.0000';
+                
+                div.innerHTML = `
+                    <div style="font-size: 1.2em; margin-bottom: 10px; color: ${statusColor}">${data.status || 'HOMEOSTASIS'}</div>
+                    Step: ${data.step}<br>
+                    Tier: ${data.tier}<br>
+                    Loss: ${lossVal}<br>
+                    Task: ${data.desc}<br>
+                    Layers: ${data.layers ? data.layers.length : 0}<br>
+                    Memory: ${data.hippocampus_size || 0} / ${data.hippocampus_capacity || 2000}
+                `;
+            } catch (e) {
+                console.error("Error updating stats:", e);
+            }
+        }
+
+        function createTextTexture(text, color) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = color;
+            ctx.font = '40px monospace';
+            ctx.fillText(text, 10, 50);
+            const tex = new THREE.CanvasTexture(canvas);
+            return tex;
+        }
+
+        function updateViz(data) {
+            // Only rebuild if structure changed significantly or first run
+            while(layersGroup.children.length > 0){ 
+                const obj = layersGroup.children[0];
+                layersGroup.remove(obj);
+                if(obj.geometry) obj.geometry.dispose();
+                if(obj.material) obj.material.dispose();
+            }
+
+            const layerCount = data.layers.length;
+            if (layerCount === 0) return;
+
+            // --- HELIX PARAMETERS ---
+            // "The DNA of Intelligence" - A spiral structure to save vertical space
+            const helixRadius = 16.0;
+            const angleStep = 0.6; // ~35 degrees per layer
+            const heightStep = 5.0; // Increased vertical rise per layer (was 2.5)
+            const totalHeight = layerCount * heightStep;
+            
+            // Generate Spine Curve (Helix)
+            const points = [];
+            for(let i=0; i<layerCount; i++) {
+                const angle = i * angleStep;
+                const y = (i * heightStep) - (totalHeight / 2);
+                const x = Math.cos(angle) * helixRadius;
+                const z = Math.sin(angle) * helixRadius;
+                points.push(new THREE.Vector3(x, y, z));
+            }
+            
+            // Ensure we have at least 2 points for the curve
+            if (points.length === 1) {
+                points.push(new THREE.Vector3(0, points[0].y + heightStep, 0));
+            }
+
+            const curve = new THREE.CatmullRomCurve3(points);
+            const frames = curve.computeFrenetFrames(layerCount, false);
+            
+            // --- 0. CENTRAL SPINE (The Residual Stream) ---
+            const spineGeo = new THREE.TubeGeometry(curve, Math.max(layerCount * 4, 20), 0.6, 8, false);
+            const spineMat = new THREE.MeshPhysicalMaterial({ 
+                color: 0x00aaff, 
+                transparent: true, 
+                opacity: 0.4, 
+                emissive: 0x0044aa,
+                emissiveIntensity: 0.3,
+                roughness: 0.2,
+                metalness: 0.8,
+                transmission: 0.5
+            });
+            const spine = new THREE.Mesh(spineGeo, spineMat);
+            layersGroup.add(spine);
+
+            // Inner Core (Glowing Signal)
+            const coreGeo = new THREE.TubeGeometry(curve, Math.max(layerCount * 4, 20), 0.15, 8, false);
+            const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const core = new THREE.Mesh(coreGeo, coreMat);
+            layersGroup.add(core);
+
+            // --- HIPPOCAMPUS (Crystalline Memory Core) ---
+            // A structured data lattice running through the center
+            const memSize = data.hippocampus_size || 0;
+            const memCap = data.hippocampus_capacity || 2000;
+            const memRatio = memSize / memCap;
+            
+            const memGroup = new THREE.Group();
+            layersGroup.add(memGroup);
+            
+            // Label
+            const memSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: createTextTexture(`Hippocampus`, '#00aaff') }));
+            memSprite.position.set(0, -totalHeight/2 - 5, 0);
+            memSprite.scale.set(6, 1.5, 1);
+            memGroup.add(memSprite);
+
+            // Memory Lattice (Hexagonal Data Column)
+            const levels = 10;
+            const cellsPerLevel = 6;
+            const totalCells = levels * cellsPerLevel;
+            const activeCells = Math.ceil(totalCells * memRatio);
+            
+            for(let l=0; l<levels; l++) {
+                const y = ((l / levels) - 0.5) * (totalHeight * 0.8);
+                for(let c=0; c<cellsPerLevel; c++) {
+                    const angle = (c / cellsPerLevel) * Math.PI * 2;
+                    const r = 3.0; // Inner radius
+                    const mx = Math.cos(angle) * r;
+                    const mz = Math.sin(angle) * r;
+                    
+                    const idx = l * cellsPerLevel + c;
+                    const isActive = idx < activeCells;
+                    
+                    // Hexagonal Prism or Cube
+                    const geo = new THREE.BoxGeometry(0.8, 0.2, 0.8);
+                    const mat = new THREE.MeshStandardMaterial({ 
+                        color: isActive ? 0x00aaff : 0x001122, 
+                        emissive: isActive ? 0x0088ff : 0x000000,
+                        emissiveIntensity: isActive ? 2.0 : 0.0,
+                        transparent: true,
+                        opacity: isActive ? 0.9 : 0.3
+                    });
+                    const mesh = new THREE.Mesh(geo, mat);
+                    mesh.position.set(mx, y, mz);
+                    mesh.lookAt(0, y, 0); // Face center
+                    
+                    // Animation data
+                    mesh.userData = { type: 'memory_cell', active: isActive, offset: idx };
+                    memGroup.add(mesh);
+                }
+            }
+
+            // Shared Geometries
+            // Increased head size from 0.3 to 0.5 for better visibility with fewer heads (4 vs 16)
+            const headGeo = new THREE.SphereGeometry(0.5, 16, 16);
+            const chunkGeo = new THREE.IcosahedronGeometry(0.4, 0);
+
+            data.layers.forEach((layer, idx) => {
+                // Sample position along the curve
+                const t = (layerCount > 1) ? idx / (layerCount - 1) : 0.5;
+                const pos = curve.getPointAt(t);
+                
+                // Get orientation frames
+                const normal = frames.normals[idx] || new THREE.Vector3(1,0,0);
+                const binormal = frames.binormals[idx] || new THREE.Vector3(0,0,1);
+                const tangent = frames.tangents[idx] || new THREE.Vector3(0,1,0);
+
+                // Create local coordinate system
+                const layerMatrix = new THREE.Matrix4();
+                layerMatrix.makeBasis(normal, binormal, tangent);
+                layerMatrix.setPosition(pos);
+                
+                // Layer Label
+                const spriteMat = new THREE.SpriteMaterial({ map: createTextTexture(`L${idx+1}`, '#ffffff') });
+                const sprite = new THREE.Sprite(spriteMat);
+                sprite.position.copy(pos).add(new THREE.Vector3(0, 1.5, 0)); 
+                sprite.scale.set(3, 0.75, 1);
+                layersGroup.add(sprite);
+                
+                // --- 1. ATTENTION HEADS (Inner Orbit) ---
+                const headRadius = 5.0;
+                const headCount = layer.head_mask.length;
+                
+                layer.head_mask.forEach((active, hIdx) => {
+                    const angle = (hIdx / headCount) * Math.PI * 2;
+                    
+                    // Position in the Normal/Binormal plane (perpendicular to spine)
+                    const lx = Math.cos(angle) * headRadius;
+                    const ly = Math.sin(angle) * headRadius;
+                    const lz = 0;
+
+                    const localPos = new THREE.Vector3(lx, ly, lz);
+                    localPos.applyMatrix4(layerMatrix);
+
+                    // Color Logic based on Entropy (Focus)
+                    // Low Entropy = Focused (Cyan/Green)
+                    // High Entropy = Confused (Orange/Red)
+                    let color = 0x00ff00;
+                    let emissive = 0x00ff00;
+                    
+                    if (active && layer.head_entropy && layer.head_entropy[hIdx] !== undefined) {
+                        const ent = layer.head_entropy[hIdx];
+                        // Map entropy 0.0 -> 1.0
+                        const t = Math.min(Math.max(ent, 0), 1.0); 
+                        const c = new THREE.Color().setHSL(0.4 - (t * 0.4), 1.0, 0.5); // 0.4(Cyan) -> 0.0(Red)
+                        color = c.getHex();
+                        emissive = c.getHex();
+                    }
+
+                    // Organic Eye Shape
+                    const mat = new THREE.MeshStandardMaterial({ 
+                        color: active ? color : 0x112211, 
+                        emissive: active ? emissive : 0x000000,
+                        emissiveIntensity: active ? 1.5 : 0.0,
+                        roughness: 0.2
+                    });
+                    const mesh = new THREE.Mesh(headGeo, mat);
+                    mesh.position.copy(localPos);
+                    mesh.userData = { type: 'head', active: active, offset: hIdx };
+                    layersGroup.add(mesh);
+
+                    // Connections (Spine <-> Head)
+                    if (active) {
+                        addCurve(pos, localPos, color, 0.5);
+                    }
+                });
+
+                // --- 2. FFN CHUNKS (Outer Orbit) ---
+                const chunkRadius = 9.0;
+                const chunkCount = layer.ffn_mask ? layer.ffn_mask.length : 0; 
+                
+                if (layer.ffn_mask) {
+                layer.ffn_mask.forEach((active, cIdx) => {
+                    const angle = (cIdx / chunkCount) * Math.PI * 2 + 0.5; // Offset
+                    const lx = Math.cos(angle) * chunkRadius;
+                    const ly = Math.sin(angle) * chunkRadius;
+                    const lz = 0;
+
+                    const localPos = new THREE.Vector3(lx, ly, lz);
+                    localPos.applyMatrix4(layerMatrix);
+
+                    // Organic Cell Shape
+                    const mat = new THREE.MeshStandardMaterial({ 
+                        color: active ? 0x9933ff : 0x220033, 
+                        emissive: active ? 0x9933ff : 0x000000,
+                        emissiveIntensity: active ? 1.0 : 0.0,
+                        wireframe: !active,
+                        transparent: true,
+                        opacity: active ? 0.9 : 0.1
+                    });
+                    const mesh = new THREE.Mesh(chunkGeo, mat);
+                    mesh.position.copy(localPos);
+                    
+                    mesh.rotation.set(Math.random(), Math.random(), Math.random());
+                    mesh.userData = { type: 'chunk', active: active, offset: cIdx };
+                    layersGroup.add(mesh);
+
+                    // Connections (Spine <-> Chunk)
+                    if (active) {
+                        addCurve(pos, localPos, 0x9933ff, 0.6);
+                    }
+                });
+            }
+            });
+
+            // Helper for organic curves
+            function addCurve(v1, v2, color, opacity) {
+                const mid = v1.clone().add(v2).multiplyScalar(0.5);
+                // Add some organic curvature
+                mid.add(new THREE.Vector3((Math.random()-0.5), (Math.random()-0.5), (Math.random()-0.5)));
+                
+                const curve = new THREE.QuadraticBezierCurve3(v1, mid, v2);
+                const points = curve.getPoints(8);
+                const geo = new THREE.BufferGeometry().setFromPoints(points);
+                const mat = new THREE.LineBasicMaterial({ 
+                    color: color, 
+                    transparent: true, 
+                    opacity: opacity 
+                });
+                const line = new THREE.Line(geo, mat);
+                
+                line.userData = { type: 'connection', active: opacity > 0.1, colorBase: new THREE.Color(color) };
+                layersGroup.add(line);
+            }
+        }
+
+        function fitCameraToSelection(camera, controls, selection, fitOffset = 1.5) {
+            const box = new THREE.Box3();
+            box.setFromObject(selection);
+            if (box.isEmpty()) return;
+
+            const size = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
+
+            const maxSize = Math.max(size.x, size.y, size.z);
+            const fitHeightDistance = maxSize / (2 * Math.atan(Math.PI * camera.fov / 360));
+            const fitWidthDistance = fitHeightDistance / camera.aspect;
+            const distance = fitOffset * Math.max(fitHeightDistance, fitWidthDistance);
+
+            const direction = camera.position.clone().sub(controls.target).normalize().multiplyScalar(distance);
+
+            // Smoothly interpolate
+            controls.target.lerp(center, 0.05);
+            camera.position.lerp(center.clone().add(direction), 0.05);
+        }
+
+        // Animation Loop
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            if (autoZoom) {
+                fitCameraToSelection(camera, controls, layersGroup);
+            }
+
+            controls.update();
+            
+            // Rotate the whole group slowly
+            layersGroup.rotation.y += 0.001;
+            
+            // Animate Elements
+            const time = Date.now() * 0.001;
+            
+            // Handle Sleep Mode Logic
+            if (isSleeping) {
+                sleepTimer--;
+                if (sleepTimer <= 0) isSleeping = false;
+                
+                // 1. Shift Atmosphere (Night Mode)
+                scene.background.lerp(new THREE.Color(0x000011), 0.05);
+                scene.fog.color.lerp(new THREE.Color(0x000011), 0.05);
+                bloomPass.strength = THREE.MathUtils.lerp(bloomPass.strength, 1.2, 0.05); // Dreamy glow
+                
+                // 2. Spawn Pruning Particles (Falling Dust) - REMOVED for Performance
+                /*
+                if (Math.random() > 0.5) {
+                    const pGeo = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+                    const pMat = new THREE.MeshBasicMaterial({ color: 0x4444ff, transparent: true, opacity: 0.8 });
+                    const p = new THREE.Mesh(pGeo, pMat);
+                    
+                    // Spawn randomly around layers
+                    const r = 5;
+                    p.position.set((Math.random()-0.5)*r, (Math.random()*20) + 5, (Math.random()-0.5)*r);
+                    p.userData = { velocity: new THREE.Vector3(0, -0.1 - Math.random()*0.1, 0), life: 1.0 };
+                    scene.add(p);
+                    pruningParticles.push(p);
+                }
+                */
+            } else {
+                // Return to Normal
+                scene.background.lerp(new THREE.Color(0x050505), 0.05);
+                scene.fog.color.lerp(new THREE.Color(0x050505), 0.05);
+                bloomPass.strength = THREE.MathUtils.lerp(bloomPass.strength, 0.6, 0.05);
+            }
+
+            // Update Pruning Particles - REMOVED
+            /*
+            for (let i = pruningParticles.length - 1; i >= 0; i--) {
+                const p = pruningParticles[i];
+                p.position.add(p.userData.velocity);
+                p.userData.life -= 0.02;
+                p.material.opacity = p.userData.life;
+                p.rotation.x += 0.1;
+                p.rotation.z += 0.1;
+                
+                if (p.userData.life <= 0) {
+                    scene.remove(p);
+                    p.geometry.dispose();
+                    p.material.dispose();
+                    pruningParticles.splice(i, 1);
+                }
+            }
+            */
+
+            layersGroup.traverse((child) => {
+                // Heads (Eyes)
+                if (child.userData.type === 'head' && child.userData.active) {
+                    const scale = 1.0 + Math.sin(time * 3 + child.userData.offset) * 0.1;
+                    child.scale.set(scale, scale, scale);
+                }
+                
+                // Chunks (Cells) - Breathing
+                if (child.userData.type === 'chunk' && child.userData.active) {
+                    child.rotation.x += 0.01;
+                    child.rotation.y += 0.01;
+                    const scale = 1.0 + Math.sin(time * 2 + child.userData.offset) * 0.1;
+                    child.scale.set(scale, scale, scale);
+                }
+
+                // Connections - Flow
+                if (child.userData.type === 'connection' && child.userData.active) {
+                    // Pulse opacity
+                    child.material.opacity = 0.3 + Math.sin(time * 5 + child.position.x) * 0.2;
+                }
+            });
+            
+            // Use composer for bloom
+            composer.render();
+        }
+        
+        animate();
+        
+        // Poll every 500ms
+        setInterval(fetchData, 500);
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            const container = document.getElementById('viz-container');
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+            
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+            renderer.setSize(width, height);
+            composer.setSize(width, height);
+            
+            resizeCanvas('blueprintCanvas');
+            resizeCanvas('memoryCanvas');
+            resizeCanvas('vitalsCanvas');
+            resizeCanvas('weightsCanvas');
+        });
+
+        function resizeCanvas(id) {
+            const canvas = document.getElementById(id);
+            const parent = canvas.parentElement;
+            canvas.width = parent.clientWidth;
+            canvas.height = parent.clientHeight;
+        }
+        
+        // Initial Resize
+        setTimeout(() => window.dispatchEvent(new Event('resize')), 100);
+    </script>
+</body>
+</html>

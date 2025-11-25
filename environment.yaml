@@ -1,0 +1,15 @@
+name: coral-env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - matplotlib
+  - fastapi
+  - uvicorn
+  - pip
+  - pytorch::pytorch
+  - pytorch::torchvision
+  - pytorch::torchaudio

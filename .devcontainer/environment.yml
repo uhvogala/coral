@@ -1,0 +1,10 @@
+name: coral-env
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - numpy
+  - matplotlib
+  - pip
