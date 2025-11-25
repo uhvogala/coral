@@ -851,7 +851,10 @@ class ArchitectController:
             # Block cost reduced to 0.3 to encourage width exploration.
             # Chunk cost 0.25 (Slightly increased to prevent spam)
             # Head cost 0.05 (Very cheap to encourage fine-grained attention)
-            costs = [-0.1, 0.05, 0.25, 0.3, 1.0] # Wait (Bonus), Head, Chunk, Block, Layer
+            # FIX: Reduced costs for Chunk and Block to better reflect their utility.
+            # If a Chunk drops loss by 0.15, it should be a net positive (0.15 - 0.10 = +0.05).
+            # Previous cost (0.25) made it a net negative (-0.10), discouraging useful growth.
+            costs = [-0.1, 0.05, 0.10, 0.20, 1.0] # Wait (Bonus), Head, Chunk, Block, Layer
             cost = costs[action_idx]
             
             reward = delta_loss - cost
@@ -1697,8 +1700,19 @@ if __name__ == "__main__":
         if target_tier == current_tier:
             should_save = False
             
-            # 1. Background Rate (0.5%) - Capture "Normal"
-            if np.random.rand() < 0.005:
+            # Calculate Fair Share for Memory Balancing
+            # If this tier is under-represented, we boost the save rate to ensure it gets a seat at the table.
+            # This prevents "Long Tiers" (like Tier 4) from dominating the Hippocampus.
+            current_count = replay.tier_counts.get(current_tier, 0)
+            fair_share = replay.capacity / max(1, current_tier)
+            
+            # 1. Background Rate
+            # Base rate 0.5%. Boost to 10% if under-represented.
+            base_rate = 0.005
+            if current_count < (fair_share * 0.5): # If less than 50% of fair share
+                base_rate = 0.10
+            
+            if np.random.rand() < base_rate:
                 should_save = True
             
             # 2. Surprise (Z-Score > 3.0) - Capture "Anomalies"
@@ -1808,9 +1822,10 @@ if __name__ == "__main__":
             if len(tier_loss_window) > 200:
                 recent = sum(tier_loss_window[-100:]) / 100
                 
-                # FIX: If loss is already low (converged), we are not frustrated!
-                # We use 0.5 as a safe threshold for "good enough" to stop panic growing.
-                if recent < 0.5:
+                # FIX: Lowered "Safe Threshold" to 0.10 to match Convergence Threshold.
+                # This ensures the model remains "Frustrated" (and trying to grow)
+                # until it actually reaches the convergence target.
+                if recent < 0.10:
                     instant_frustration = 0.0
                 else:
                     older = sum(tier_loss_window[-200:-100]) / 100
@@ -2193,11 +2208,11 @@ if __name__ == "__main__":
             smooth_loss = 10.0
             
         # Condition: Min steps passed AND (Loss is low OR Max steps passed)
-        # We use 0.15 as convergence threshold (reasonable for this vocab size)
-        # FIX: Increased max steps to 3000 to match schedule and allow for growth.
-        # FIX: Increased convergence threshold from 0.05 to 0.15 to avoid chasing noise.
-        is_converged = (smooth_loss < 0.15)
-        is_maxed_out = (step_in_tier >= 3000)
+        # We use 0.10 as convergence threshold (stricter, as requested).
+        # FIX: Increased max steps to 6000 to prevent "giving up" too early.
+        # FIX: Decreased convergence threshold from 0.15 to 0.10.
+        is_converged = (smooth_loss < 0.10)
+        is_maxed_out = (step_in_tier >= 6000)
         is_min_steps = (step_in_tier >= 300)
         
         # STAGNATION CHECK: If we are stuck for a long time with no improvement
@@ -2205,6 +2220,7 @@ if __name__ == "__main__":
         # Stagnation should trigger GROWTH (via Architect), not skipping the tier.
         # If we skip, we reset frustration and the model never learns to grow.
         
+        # LOGIC: Only advance if converged OR if we hit the hard limit (Mercy Rule).
         if is_min_steps and (is_converged or is_maxed_out):
              if current_tier < TIERS:
                  # Before switching, memorize some of the current tier
